@@ -1,0 +1,11 @@
+zone_id: a0e0184261924d449b673e1ae0a3df04
+token: zFTsCDbMk69Ncegah6dxhyxeyyOJxazRh6SKEE2Y
+frequency: 4h
+verbose: true
+domains:
+  - hostname: a.example.com
+    proxied: true
+  - hostname: b.example.com
+    proxied: true
+  - hostname: c.example.com
+    proxied: false
