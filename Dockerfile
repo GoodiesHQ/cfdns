@@ -6,7 +6,8 @@ COPY cmd ./cmd
 COPY config ./config
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/cfdns ./cmd
 
-FROM scratch
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
 COPY --from=builder /app/cfdns /app/cfdns
 WORKDIR /app
 ENTRYPOINT ["/app/cfdns"]
