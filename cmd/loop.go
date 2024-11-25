@@ -23,12 +23,9 @@ func loop(ctx context.Context, api *cloudflare.API, cfg *config.Config) {
 	}()
 
 	if cfg.IPv4 {
-		ipv4, err := GetPublicIPv4()
-		if err != nil {
+		if ipv4, err := GetPublicIPv4(); err != nil {
 			log.Panic().Err(err).Msg("failed to get public ipv4")
-		}
-
-		if ipv4 != currentIPv4 {
+		} else if ipv4 != currentIPv4 {
 			currentIPv4 = ipv4
 			log.Info().Msgf("updated ipv4 address: %s", ipv4)
 		}
@@ -45,12 +42,9 @@ func loop(ctx context.Context, api *cloudflare.API, cfg *config.Config) {
 	}
 
 	if cfg.IPv6 {
-		ipv6, err := GetPublicIPv6()
-		if err != nil {
+		if ipv6, err := GetPublicIPv6(); err != nil {
 			log.Panic().Err(err).Msg("failed to get public ipv6")
-		}
-
-		if ipv6 != currentIPv6 {
+		} else if ipv6 != currentIPv6 {
 			currentIPv6 = ipv6
 			log.Info().Msgf("updated ipv6 address: %s", ipv6)
 		}

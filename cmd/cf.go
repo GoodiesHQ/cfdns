@@ -53,6 +53,7 @@ func checkAndUpdate(
 			Name:    domain.Hostname,
 			Content: address,
 			Type:    recordType,
+			Proxied: domain.Proxied,
 		})
 		if err != nil {
 			return err
@@ -70,7 +71,7 @@ func checkAndUpdate(
 		ctxTimeout, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		if record.Content == address {
+		if record.Content == address && (record.Proxied == nil || domain.Proxied == nil || (*record.Proxied == *domain.Proxied)) {
 			log.Info().
 				Str("id", record.ID).
 				Str("hostname", record.Name).
