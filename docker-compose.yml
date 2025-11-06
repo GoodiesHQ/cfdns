@@ -1,0 +1,14 @@
+services:
+  cfdns:
+    image: goodieshq/cfdns:latest
+    restart: unless-stopped
+    container_name: cfdns
+    pull_policy: always
+    networks:
+      - frontend
+    volumes:
+      # This directory must contain cfdns.yaml configuration file
+      - /path/to/cfdns/config:/app/config:ro
+networks:
+  frontend:
+    external: true
