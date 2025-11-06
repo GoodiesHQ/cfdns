@@ -75,7 +75,7 @@ func main() {
 			log.Info().Msg("cfdns stopped")
 			return
 		case <-time.After(cfg.Frequency):
-		case _, _ = <-watcher:
+		case <-watcher:
 			// check file modification time and reload if changed
 			log.Info().Msg("configuration file changed, reloading...")
 			cfg, err = config.LoadConfig(info.ConfigFile)
