@@ -15,7 +15,7 @@ import (
 )
 
 const VERSION = "0.3.0"
-const DEFAULT_CONFIG_FILE = "cfdns.yaml"
+const DEFAULT_CONFIG_FILE = "config/cfdns.yaml"
 
 type CLIFlags struct {
 	ConfigFile string
