@@ -3,19 +3,20 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go"
 	"github.com/goodieshq/cfdns/pkg/cf"
 	"github.com/goodieshq/cfdns/pkg/config"
+	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
-const VERSION = "0.3.0"
-const DEFAULT_CONFIG_FILE = "config/cfdns.yaml"
+const VERSION = "0.3.1"
 
 type CLIFlags struct {
 	ConfigFile string
@@ -23,72 +24,98 @@ type CLIFlags struct {
 
 func init() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	godotenv.Load()
 }
 
 func main() {
-	log.Info().Str("version", VERSION).Msg("starting cfdns...")
+	log.Info().Str("version", VERSION).Msg("Starting CFDNS...")
 	info := cli()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	// create a context that is cancelled on SIGINT or SIGTERM
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// load the configuration file from JSON or YAML
+	// load the initial configuration from the YAML file
 	cfg, err := config.LoadConfig(info.ConfigFile)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config file")
 	}
 
-	var cfopts []cloudflare.Option
-
-	// set the log output verbosity level
+	// set the initial logging level based on config
 	if cfg.Verbose {
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	} else {
-		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	}
 
-	cfdns, err := cf.NewCFDNS(*cfg, cfopts...)
+	// Create the cfdns instance
+	cfdns, err := cf.NewCFDNS(*cfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create cfdns instance")
 	}
 
-	// check if the provided zone ID is valid for the scoped token
-	valid, err := cfdns.ZoneIsValid(ctx)
-	if !valid {
-		evt := log.Fatal()
-		if err != nil {
-			evt = evt.Err(err)
-		}
-		evt.Msg("failed to validate the zone")
-	}
-
+	// create a file watcher for the config file to signal changes
 	watcher := watchFile(ctx, info.ConfigFile)
 
 	for {
-		log.Info().Msg("starting cfdns processing cycle...")
+		// create a timer for the processing frequency
+		timer := time.NewTimer(cfg.Frequency)
+		stop := func() {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+
+		tStart := time.Now()
+		log.Debug().Msg("Starting CFDNS processing cycle.")
 		cfdns.Process(ctx)
 		cfdns.Wait()
+		log.Info().Str("duration", Dur(time.Since(tStart))).Msg("Completed CFDNS processing cycle.")
+
+		// wait for the next cycle, config file modification, or shutdown signal
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("shutting down cfdns...")
+			stop()
+			log.Warn().Msg("Shutting down CFDNS...")
 			cfdns.Close()
-			log.Info().Msg("cfdns stopped")
+			log.Info().Msg("CFDNS stopped. Exiting.")
 			return
-		case <-time.After(cfg.Frequency):
-		case <-watcher:
+		case <-timer.C:
+			// continue to next processing cycle
+			continue
+		case _, ok := <-watcher:
+			stop()
+			if !ok {
+				watcher = nil
+				continue
+			}
+
 			// check file modification time and reload if changed
-			log.Info().Msg("configuration file changed, reloading...")
-			cfg, err = config.LoadConfig(info.ConfigFile)
+			log.Info().Msg("Configuration file changed, reloading...")
+
+			// load the new configuration from file
+			cfgNew, err := config.LoadConfig(info.ConfigFile)
 			if err != nil {
 				log.Error().Err(err).Msg("failed to reload config file, keeping existing configuration")
 				continue
 			}
-			if cfg.Verbose {
-				zerolog.SetGlobalLevel(zerolog.InfoLevel)
-			} else {
-				zerolog.SetGlobalLevel(zerolog.ErrorLevel)
+
+			// set the new configuration
+			if err := cfdns.SetConfig(cfgNew); err != nil {
+				log.Error().Err(err).Msg("failed to apply new configuration, keeping existing configuration")
+				continue
 			}
-			cfdns.SetConfig(cfg)
+
+			// update logging level based on new config
+			if cfg.Verbose {
+				zerolog.SetGlobalLevel(zerolog.DebugLevel)
+			} else {
+				zerolog.SetGlobalLevel(zerolog.InfoLevel)
+			}
+			log.Info().Msg("Configuration reloaded successfully.")
 		}
 	}
 }
@@ -100,18 +127,43 @@ func cli() *CLIFlags {
 	flag.Parse()
 
 	if cliFlags.ConfigFile == "" {
-		cliFlags.ConfigFile = DEFAULT_CONFIG_FILE
+		log.Fatal().Msg("configuration file is required, use -config/-c to specify the file")
 	}
 
 	return &cliFlags
 }
 
-func getLastModTime(filename string) time.Time {
+type FileSig struct {
+	ModTime time.Time
+	Size    int64
+	Inode   uint64
+}
+
+func (fs1 *FileSig) Changed(fs2 *FileSig) bool {
+	if fs1 == nil || fs2 == nil {
+		return false
+	}
+	return fs2.ModTime.After(fs1.ModTime) ||
+		fs2.Size != fs1.Size ||
+		fs2.Inode != fs1.Inode
+}
+
+func getFileSig(filename string) *FileSig {
 	info, err := os.Stat(filename)
 	if err != nil {
-		return time.Time{}
+		return nil
 	}
-	return info.ModTime()
+
+	var inode uint64
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		inode = st.Ino
+	}
+
+	return &FileSig{
+		ModTime: info.ModTime(),
+		Size:    info.Size(),
+		Inode:   inode,
+	}
 }
 
 func watchFile(ctx context.Context, filename string) <-chan struct{} {
@@ -119,30 +171,35 @@ func watchFile(ctx context.Context, filename string) <-chan struct{} {
 	interval := 1 * time.Second
 
 	go func() {
-		modTime := getLastModTime(filename)
+		defer close(ch)
+
+		fileSig := getFileSig(filename)
+
+		t := time.NewTicker(interval)
+		defer t.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(interval):
-				// get the last modification time of the file
-				newModTime := getLastModTime(filename)
+			case <-t.C:
+				// get the metadata signature of the file
+				fileSigNew := getFileSig(filename)
 
 				// if we couldn't get the mod time, skip this iteration
-				if newModTime.IsZero() {
+				if fileSigNew == nil {
 					continue
 				}
 
 				// if this is the first time checking, just set the modTime
-				if modTime.IsZero() {
-					modTime = newModTime
+				if fileSig == nil {
+					fileSig = fileSigNew
 					continue
 				}
 
-				// if the modification time has changed, notify via channel
-				if newModTime.After(modTime) {
-					modTime = newModTime
-					<-time.After(50 * time.Millisecond)
+				if fileSig.Changed(fileSigNew) {
+					// update the stored signature and notify
+					fileSig = fileSigNew
 					select {
 					case ch <- struct{}{}:
 					default:
@@ -152,4 +209,31 @@ func watchFile(ctx context.Context, filename string) <-chan struct{} {
 		}
 	}()
 	return ch
+}
+
+func Dur(d time.Duration) string {
+	const precision = 2
+
+	switch {
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	case d < time.Millisecond:
+		f := "%." + fmt.Sprintf("%d", precision) + "fµs"
+		return fmt.Sprintf(f, float64(d.Nanoseconds())/1000)
+	case d < time.Second:
+		f := "%." + fmt.Sprintf("%d", precision) + "fms"
+		return fmt.Sprintf(f, float64(d.Microseconds())/1000)
+	case d < time.Minute:
+		f := "%." + fmt.Sprintf("%d", precision) + "fs"
+		return fmt.Sprintf(f, d.Seconds())
+	case d < time.Hour:
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm%ds", m, s)
+	default:
+		h := int(d.Hours())
+		m := int(d.Minutes()) % 60
+		s := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	}
 }
