@@ -2,7 +2,6 @@ package cf
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/goodieshq/cfdns/pkg/config"
 	"github.com/goodieshq/cfdns/pkg/ipget"
 	"github.com/goodieshq/goropo"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -20,52 +20,87 @@ const (
 )
 
 type CFDNS struct {
-	mu         sync.Mutex
-	cfg        config.Config
-	api        *cloudflare.API
-	httpClient http.Client
-	myIPv4     string
-	myIPv6     string
-	pool       *goropo.Pool
+	mu         sync.RWMutex    // protects config, api, httpClient, pool
+	cfg        config.Config   // current configuration
+	api        *cloudflare.API // Cloudflare API client
+	httpClient http.Client     // shared HTTP client
+	timeout    time.Duration   // HTTP timeout duration
+	pool       *goropo.Pool    // worker pool for concurrent tasks
 }
 
-func NewCFDNS(cfg config.Config, options ...cloudflare.Option) (*CFDNS, error) {
-	// create a new cloudflare API client from the scoped token
-	api, err := cloudflare.NewWithAPIToken(cfg.Token, options...)
-	if err != nil {
-		return nil, err
+// NewCFDNS creates a new Cloudflare DNS updater instance
+func NewCFDNS(cfg config.Config) (*CFDNS, error) {
+	cfdns := &CFDNS{}
+	cfdns.SetConfig(&cfg)
+	return cfdns, nil
+}
+
+// Close aborts all pending tasks and closes the worker pool
+func (cfdns *CFDNS) Close() {
+	cfdns.mu.Lock()
+	pool := cfdns.pool
+	if pool == nil {
+		cfdns.mu.Unlock()
+		return
 	}
 
-	return &CFDNS{
-		api: api,
-		cfg: cfg,
-		httpClient: http.Client{
-			Timeout: 5 * time.Second,
-		},
-		pool: goropo.NewPool(10, 50),
-	}, nil
+	// close while holding write lock so SetConfig/other writers can't race
+	pool.Abort()
+	cfdns.mu.Unlock()
 }
 
-func (cfdns *CFDNS) Close() {
-	// abort all tasks in the pool and close it
-	cfdns.pool.Abort()
-	cfdns.pool.Close()
-}
-
+// Wait will wait for all tasks in the pool to complete
 func (cfdns *CFDNS) Wait() {
-	// wait for all tasks in the pool to complete
-	cfdns.pool.WaitIdle()
+	cfdns.mu.RLock()
+	pool := cfdns.pool
+	if pool == nil {
+		cfdns.mu.RUnlock()
+		return
+	}
+
+	// keep RLock held while waiting so a concurrent SetConfig (writer) will block
+	pool.WaitIdle()
+	cfdns.mu.RUnlock()
 }
 
-func (cfdns *CFDNS) SetConfig(cfg *config.Config) {
+func (cfdns *CFDNS) SetConfig(cfg *config.Config) error {
 	if cfg != nil {
 		cfdns.mu.Lock()
+		defer cfdns.mu.Unlock()
+
+		// create a new cloudflare API client from the scoped token
+		api, err := cloudflare.NewWithAPIToken(cfg.Token)
+		if err != nil {
+			return err
+		}
+
+		// swap in the new config and resources
+		cfdns.api = api
+		cfdns.httpClient = http.Client{
+			Timeout: cfg.Timeout,
+		}
+		if cfdns.pool != nil {
+			// close previous pool before replacing
+			cfdns.pool.Close()
+		}
+
+		cfdns.timeout = cfg.Timeout
+		cfdns.pool = goropo.NewPool(cfg.WorkerCount, cfg.WorkerCount*5)
+
+		if cfg.Verbose {
+			zerolog.SetGlobalLevel(zerolog.DebugLevel)
+		} else {
+			zerolog.SetGlobalLevel(zerolog.InfoLevel)
+		}
 		cfdns.cfg = *cfg
-		cfdns.mu.Unlock()
 	}
+	return nil
 }
 
+// getRecords retrieves DNS records for the given hostname and record type
 func (cfdns *CFDNS) getRecords(ctx context.Context, hostname, recordType string) ([]cloudflare.DNSRecord, error) {
+	cfdns.mu.RLock()
+	defer cfdns.mu.RUnlock()
 	records, _, err := cfdns.api.ListDNSRecords(
 		ctx,
 		cloudflare.ZoneIdentifier(cfdns.cfg.ZoneID),
@@ -80,21 +115,30 @@ func (cfdns *CFDNS) getRecords(ctx context.Context, hostname, recordType string)
 	return records, nil
 }
 
+// ZoneIsValid checks if the configured zone ID is valid for the provided API token
 func (cfdns *CFDNS) ZoneIsValid(ctx context.Context) (bool, error) {
-	zones, err := goropo.Submit(
-		cfdns.pool,
+	cfdns.mu.RLock()
+	pool := cfdns.pool
+	api := cfdns.api
+	zoneID := cfdns.cfg.ZoneID
+
+	fut := goropo.Submit(
+		pool,
 		ctx,
 		func(ctx context.Context) ([]cloudflare.Zone, error) {
-			return cfdns.api.ListZones(ctx)
+			return api.ListZones(ctx)
 		},
-	).Await(ctx)
+	)
+
+	zones, err := fut.Await(ctx)
+	cfdns.mu.RUnlock()
 
 	if err != nil {
 		return false, err
 	}
 
 	for _, zone := range zones {
-		if zone.ID == cfdns.cfg.ZoneID {
+		if zone.ID == zoneID {
 			return true, nil
 		}
 	}
@@ -102,31 +146,20 @@ func (cfdns *CFDNS) ZoneIsValid(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (cfdns *CFDNS) CheckAndUpdateIPv4(ctx context.Context, domain *config.Domain) error {
-	if cfdns.myIPv4 == "" {
-		return fmt.Errorf("no ipv4 address to update")
-	}
-	return cfdns.checkAndUpdate(ctx, domain, RECORD_TYPE_IPV4, cfdns.myIPv4)
-}
-
-func (cfdns *CFDNS) CheckAndUpdateIPv6(ctx context.Context, domain *config.Domain) error {
-	if cfdns.myIPv6 == "" {
-		return fmt.Errorf("no ipv6 address to update")
-	}
-	return cfdns.checkAndUpdate(ctx, domain, RECORD_TYPE_IPV6, cfdns.myIPv6)
-}
-
+// checkAndUpdate checks the existing DNS records for the given domain and record type,
+// and updates or creates the record if the address has changed or does not exist.
+// Caller must hold cfdns.mu RLock.
 func (cfdns *CFDNS) checkAndUpdate(
 	ctx context.Context,
 	domain *config.Domain,
 	recordType,
 	address string,
 ) error {
-	const timeout = time.Second * 5
+	const timeout = time.Second * 10
 
+	// get existing records for this hostname and record type
 	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
 	records, err := cfdns.getRecords(ctxTimeout, domain.Hostname, recordType)
 	if err != nil {
 		return err
@@ -155,10 +188,11 @@ func (cfdns *CFDNS) checkAndUpdate(
 			Str("hostname", recordNew.Name).
 			Str("type", recordNew.Type).
 			Str("address", recordNew.Content).
-			Msgf("created DNS record")
+			Msgf("Created new DNS record")
 		return nil
 	}
 
+	// iterate over existing records and update if the address has changed
 	for _, record := range records {
 		ctxTimeout, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
@@ -167,12 +201,12 @@ func (cfdns *CFDNS) checkAndUpdate(
 			domain.Proxied == nil ||
 			(*record.Proxied == *domain.Proxied)) {
 
-			log.Info().
+			log.Debug().
 				Str("id", record.ID).
 				Str("hostname", record.Name).
 				Str("type", record.Type).
 				Str("address", record.Content).
-				Msgf("skipping DNS record")
+				Msgf("Skipping DNS record")
 			return nil
 		}
 
@@ -191,7 +225,7 @@ func (cfdns *CFDNS) checkAndUpdate(
 				Str("hostname", record.Name).
 				Str("type", record.Type).
 				Str("address", record.Content).
-				Msg("failed to update DNS record")
+				Msg("Failed to update DNS record")
 			return err
 		}
 
@@ -200,68 +234,72 @@ func (cfdns *CFDNS) checkAndUpdate(
 			Str("hostname", recordNew.Name).
 			Str("type", recordNew.Type).
 			Str("address", recordNew.Content).
-			Msgf("updated DNS record")
+			Msgf("Updated DNS record")
 	}
 	return nil
 }
 
-func (cfdns *CFDNS) setPublicIPs(ctx context.Context) {
+func (cfdns *CFDNS) getPublicIPs(ctx context.Context) (string, string) {
 	var fut4, fut6 *goropo.Future[string]
+	var ipv4, ipv6 string
 
-	if cfdns.cfg.IPv4 {
+	if *cfdns.cfg.IPv4 {
 		fut4 = goropo.Submit(cfdns.pool, ctx, ipget.GetPublicIPv4)
-	} else {
-		cfdns.myIPv4 = ""
 	}
 
-	if cfdns.cfg.IPv6 {
+	if *cfdns.cfg.IPv6 {
 		fut6 = goropo.Submit(cfdns.pool, ctx, ipget.GetPublicIPv6)
-	} else {
-		cfdns.myIPv6 = ""
 	}
 
 	if fut4 != nil {
-		ipv4, err4 := fut4.Await(ctx)
-		if err4 != nil {
-			cfdns.myIPv4 = ""
-			log.Error().Err(err4).Msg("failed to get public ipv4")
-		} else if ipv4 != cfdns.myIPv4 {
-			cfdns.myIPv4 = ipv4
-			log.Info().Str("new_ipv4", ipv4).Msg("updated ipv4 address")
+		v, err := fut4.Await(ctx)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to get public ipv4")
+			ipv4 = ""
+		} else {
+			ipv4 = v
+			log.Debug().Str("ipv4", ipv4).Msg("fetched ipv4 address")
 		}
 	}
 
 	if fut6 != nil {
-		ipv6, err6 := fut6.Await(ctx)
-		if err6 != nil {
-			cfdns.myIPv6 = ""
-			log.Error().Err(err6).Msg("failed to get public ipv6")
-		} else if ipv6 != cfdns.myIPv6 {
-			cfdns.myIPv6 = ipv6
-			log.Info().Str("new_ipv6", ipv6).Msg("updated ipv6 address")
+		v, err := fut6.Await(ctx)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to get public ipv6")
+			ipv6 = ""
+		} else {
+			ipv6 = v
+			log.Debug().Str("ipv6", ipv6).Msg("fetched ipv6 address")
 		}
 	}
+
+	return ipv4, ipv6
 }
 
 func (cfdns *CFDNS) Process(ctx context.Context) {
-	// lock the config
-	cfdns.mu.Lock()
-	defer cfdns.mu.Unlock()
+	cfdns.mu.RLock()
+	defer cfdns.mu.RUnlock()
 
-	// acquire and set the current public IP addresses for this instance
-	cfdns.setPublicIPs(ctx)
+	valid, err := cfdns.ZoneIsValid(ctx)
+	if err != nil || !valid {
+		log.Error().Err(err).Msg("unable to verify zone and API token, skipping processing cycle")
+		return
+	}
+
+	// acquire the current public IP addresses for this run
+	ipv4, ipv6 := cfdns.getPublicIPs(ctx)
+
+	// make a list of futures for all domain updates, allocate enough for both ipv4 and ipv6
 	futs := make([]*goropo.FutureAny, 0, len(cfdns.cfg.Domains)*2)
 
 	// iterate over all configured domains and update their DNS records as needed
 	for _, domain := range cfdns.cfg.Domains {
-		domain := domain // capture range variable
-
-		if cfdns.cfg.IPv4 {
+		if *cfdns.cfg.IPv4 && ipv4 != "" {
 			fut := goropo.Submit(
 				cfdns.pool,
 				ctx,
 				func(ctx context.Context) (any, error) {
-					if err := cfdns.CheckAndUpdateIPv4(ctx, &domain); err != nil {
+					if err := cfdns.checkAndUpdate(ctx, &domain, RECORD_TYPE_IPV4, ipv4); err != nil {
 						log.Error().Err(err).Str("domain", domain.Hostname).Msg("failed to update ipv4 record")
 						return nil, err
 					}
@@ -271,13 +309,13 @@ func (cfdns *CFDNS) Process(ctx context.Context) {
 			futs = append(futs, fut)
 		}
 
-		if cfdns.cfg.IPv6 {
+		if *cfdns.cfg.IPv6 && ipv6 != "" {
 			fut := goropo.Submit(
 				cfdns.pool,
 				ctx,
 				func(ctx context.Context) (any, error) {
-					if err := cfdns.CheckAndUpdateIPv6(ctx, &domain); err != nil {
-						log.Error().Err(err).Str("domain", domain.Hostname).Msg("failed to update ipv4 record")
+					if err := cfdns.checkAndUpdate(ctx, &domain, RECORD_TYPE_IPV6, ipv6); err != nil {
+						log.Error().Err(err).Str("domain", domain.Hostname).Msg("failed to update ipv6 record")
 						return nil, err
 					}
 					return nil, nil
