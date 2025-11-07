@@ -20,4 +20,7 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=builder /out/cfdns /app/cfdns
+
+# Default command
 ENTRYPOINT ["/app/cfdns"]
+CMD ["-config", "/app/config/cfdns.yaml"]
